@@ -152,6 +152,7 @@ boost::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo
   // and ConstantLanelet does not rewrite the value,
   // we keep front_lane together as a representative.
   std::vector<std::pair<lanelet::ConstLanelet, lanelet::ConstLanelet>> combined_and_front_vec{};
+  lanelet::ConstLanelet next_lanelet;
   for (const auto & lane_id : unique_lane_ids) {
     // Skip if already processed
     if (processed_lanes.find(lane_id) != processed_lanes.end()) continue;
@@ -165,30 +166,12 @@ boost::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo
       const std::string lane_attribute =
         current_lane.attributeOr("turn_direction", std::string("none"));
 
-      // check next lanes
-      auto next_lanes = route_handler.getNextLanelets(current_lane);
-      if (next_lanes.empty()) {
+      lanelet::ConstLanelet next_lane{};
+      if (!route_handler.getNextLaneletWithinRoute(current_lane, &next_lane)) {
         break;
       }
 
-      // filter next lanes with same attribute in the path
-      std::vector<lanelet::ConstLanelet> next_lanes_in_path{};
-      std::copy_if(
-        next_lanes.begin(), next_lanes.end(), std::back_inserter(next_lanes_in_path),
-        [&](const auto & next_lane) {
-          const bool is_in_unique_ids =
-            std::find(unique_lane_ids.begin(), unique_lane_ids.end(), next_lane.id()) !=
-            unique_lane_ids.end();
-          const bool has_same_attribute =
-            next_lane.attributeOr("turn_direction", std::string("none")) == lane_attribute;
-          return is_in_unique_ids && has_same_attribute;
-        });
-      if (next_lanes_in_path.empty()) {
-        break;
-      }
-
-      // assume that the next lane in the path is only one
-      current_lane = next_lanes_in_path.front();
+      current_lane = next_lane;
     }
 
     if (!combined_lane_elems.empty()) {
