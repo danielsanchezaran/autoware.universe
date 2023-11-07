@@ -832,8 +832,6 @@ double PidLongitudinalController::applySlopeCompensation(
   // Acceleration command is always positive independent of direction (= shift) when car is running
   double sign = (shift == Shift::Forward) ? 1.0 : (shift == Shift::Reverse ? -1.0 : 0);
   double compensated_acc = input_acc + sign * 9.81 * std::sin(pitch_limited);
-  std::cerr << "Compensated acc - input: " << compensated_acc - input_acc << "\n";
-  std::cerr << "Input acc " << input_acc << "\n";
   return compensated_acc;
 }
 
