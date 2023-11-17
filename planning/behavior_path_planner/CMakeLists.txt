@@ -22,6 +22,8 @@ ament_auto_add_library(behavior_path_planner_node SHARED
   src/scene_module/goal_planner/manager.cpp
   src/scene_module/side_shift/side_shift_module.cpp
   src/scene_module/side_shift/manager.cpp
+  src/scene_module/sampling_planner/sampling_planner_module.cpp
+  src/scene_module/sampling_planner/manager.cpp
   src/scene_module/lane_change/interface.cpp
   src/scene_module/lane_change/normal.cpp
   src/scene_module/lane_change/external_request.cpp
@@ -30,6 +32,7 @@ ament_auto_add_library(behavior_path_planner_node SHARED
   src/turn_signal_decider.cpp
   src/utils/utils.cpp
   src/utils/path_utils.cpp
+  src/utils/traffic_light_utils.cpp
   src/utils/path_safety_checker/safety_check.cpp
   src/utils/path_safety_checker/objects_filtering.cpp
   src/utils/start_goal_planner_common/utils.cpp
@@ -50,7 +53,6 @@ ament_auto_add_library(behavior_path_planner_node SHARED
   src/utils/drivable_area_expansion/drivable_area_expansion.cpp
   src/utils/drivable_area_expansion/map_utils.cpp
   src/utils/drivable_area_expansion/footprints.cpp
-  src/utils/drivable_area_expansion/expansion.cpp
   src/utils/geometric_parallel_parking/geometric_parallel_parking.cpp
   src/utils/occupancy_grid_based_collision_detector/occupancy_grid_based_collision_detector.cpp
   src/marker_utils/utils.cpp

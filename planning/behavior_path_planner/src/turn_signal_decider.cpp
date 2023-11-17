@@ -166,8 +166,12 @@ boost::optional<TurnSignalInfo> TurnSignalDecider::getIntersectionTurnSignalInfo
       const std::string lane_attribute =
         current_lane.attributeOr("turn_direction", std::string("none"));
 
+      // check next lane has the same attribute
       lanelet::ConstLanelet next_lane{};
       if (!route_handler.getNextLaneletWithinRoute(current_lane, &next_lane)) {
+        break;
+      }
+      if (next_lane.attributeOr("turn_direction", std::string("none")) != lane_attribute) {
         break;
       }
 
