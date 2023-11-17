@@ -251,7 +251,7 @@ BehaviorModuleOutput SamplingPlannerModule::plan()
   }
 
   BehaviorModuleOutput out;
-  const double velocity = 1.5;
+  const double velocity = 0.5;
   const double max_length = *std::max_element(
     internal_params_->sampling.target_lengths.begin(),
     internal_params_->sampling.target_lengths.end());

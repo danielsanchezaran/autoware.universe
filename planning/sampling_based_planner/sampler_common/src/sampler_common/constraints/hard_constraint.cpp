@@ -47,10 +47,11 @@ MultiPoint2d checkHardConstraints(Path & path, const Constraints & constraints)
     }
   }
   path.constraint_results.collision = !has_collision(footprint, constraints.obstacle_polygons);
-  if (!satisfyMinMax(
-        path.curvatures, constraints.hard.min_curvature, constraints.hard.max_curvature)) {
-    path.constraint_results.curvature = false;
-  }
+  // if (!satisfyMinMax(
+  //       path.curvatures, constraints.hard.min_curvature, constraints.hard.max_curvature)) {
+  //   path.constraint_results.curvature = false;
+  // }
+  path.constraint_results.curvature = true;
   return footprint;
 }
 }  // namespace sampler_common::constraints
