@@ -139,11 +139,11 @@ bool SamplingPlannerModule::isExecutionRequested() const
     return false;
   }
 
-  const auto & goal_pose = planner_data_->route_handler->getGoalPose();
-  const auto & ego_pose = planner_data_->self_odometry->pose.pose;
-  const double distance_to_goal = std::hypot(
-    ego_pose.position.x - goal_pose.position.x, ego_pose.position.y - goal_pose.position.y);
-  if (distance_to_goal < 8.0) return false;
+  // const auto & goal_pose = planner_data_->route_handler->getGoalPose();
+  // const auto & ego_pose = planner_data_->self_odometry->pose.pose;
+  // const double distance_to_goal = std::hypot(
+  //   ego_pose.position.x - goal_pose.position.x, ego_pose.position.y - goal_pose.position.y);
+  // if (distance_to_goal < 8.0) return false;
 
   return true;
 }
