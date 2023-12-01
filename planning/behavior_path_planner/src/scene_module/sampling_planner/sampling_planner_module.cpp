@@ -14,6 +14,8 @@
 
 #include "behavior_path_planner/scene_module/sampling_planner/sampling_planner_module.hpp"
 
+#include <boost/geometry/algorithms/within.hpp>
+
 namespace behavior_path_planner
 {
 using geometry_msgs::msg::Point;
@@ -36,6 +38,94 @@ SamplingPlannerModule::SamplingPlannerModule(
   internal_params_ =
     std::shared_ptr<SamplingPlannerInternalParameters>(new SamplingPlannerInternalParameters{});
   updateModuleParams(parameters);
+
+  hard_constraints_.emplace_back(
+    [](
+      sampler_common::Path & path, const sampler_common::Constraints & constraints,
+      const MultiPoint2d & footprint) -> bool {
+      if (!footprint.empty()) {
+        path.constraint_results.drivable_area =
+          boost::geometry::within(footprint, constraints.drivable_polygons);
+      }
+
+      path.constraint_results.collision =
+        !sampler_common::constraints::has_collision(footprint, constraints.obstacle_polygons);
+      return path.constraint_results.collision && path.constraint_results.drivable_area;
+    });
+
+  hard_constraints_.emplace_back(
+    [](
+      sampler_common::Path & path, const sampler_common::Constraints & constraints,
+      [[maybe_unused]] const MultiPoint2d & footprint) -> bool {
+      const bool curvatures_satisfied =
+        std::all_of(path.curvatures.begin(), path.curvatures.end(), [&](const auto & v) -> bool {
+          return (v > constraints.hard.min_curvature) && (v < constraints.hard.max_curvature);
+        });
+      path.constraint_results.curvature = curvatures_satisfied;
+      return curvatures_satisfied;
+    });
+
+  // TODO(Daniel): Maybe add a soft cost for average distance to centerline?
+  // TODO(Daniel): Think of methods to prevent chattering
+
+  //  Yaw difference
+  // soft_constraints_.emplace_back(
+  //   [&](
+  //     sampler_common::Path & path, [[maybe_unused]] const sampler_common::Constraints &
+  //     constraints,
+  //     [[maybe_unused]] const SoftConstraintsInputs & input_data) -> double {
+  //     if (path.points.empty()) return 0.0;
+  //     const auto & goal_pose_yaw =
+  //     tier4_autoware_utils::getRPY(input_data.goal_pose.orientation).z; const auto &
+  //     last_point_yaw = path.yaws.back(); const double angle_difference = std::abs(last_point_yaw
+  //     - goal_pose_yaw); return angle_difference / (3.141519 / 4.0);
+  //   });
+
+  //  Distance to goal
+  soft_constraints_.emplace_back(
+    [&](
+      sampler_common::Path & path, [[maybe_unused]] const sampler_common::Constraints & constraints,
+      [[maybe_unused]] const SoftConstraintsInputs & input_data) -> double {
+      if (path.points.empty()) return 0.0;
+      const auto & goal_pose = input_data.goal_pose;
+      const auto & ego_pose = input_data.ego_pose;
+      const auto & last_point = path.points.back();
+
+      const double distance_ego_to_goal_pose = std::hypot(
+        goal_pose.position.x - ego_pose.position.x, goal_pose.position.y - ego_pose.position.y);
+      const double distance_path_to_goal =
+        std::hypot(goal_pose.position.x - last_point.x(), goal_pose.position.y - last_point.y());
+      constexpr double epsilon = 0.001;
+      if (distance_ego_to_goal_pose < epsilon) return 0.0;
+      const double max_target_length = *std::max_element(
+        internal_params_->sampling.target_lengths.begin(),
+        internal_params_->sampling.target_lengths.end());
+      if (distance_ego_to_goal_pose > max_target_length)
+        return distance_path_to_goal / distance_ego_to_goal_pose;
+      constexpr double pi = 3.141519;
+      const auto & goal_pose_yaw = tier4_autoware_utils::getRPY(input_data.goal_pose.orientation).z;
+      const auto & last_point_yaw = path.yaws.back();
+      const double angle_difference = std::abs(last_point_yaw - goal_pose_yaw);
+      return (distance_path_to_goal / distance_ego_to_goal_pose) + (angle_difference / (pi / 4.0));
+    });
+
+  // Curvature cost
+  soft_constraints_.emplace_back(
+    [](
+      sampler_common::Path & path, [[maybe_unused]] const sampler_common::Constraints & constraints,
+      [[maybe_unused]] const SoftConstraintsInputs & input_data) -> double {
+      if (path.curvatures.empty()) return std::numeric_limits<double>::max();
+      double curvature_sum = 0.0;
+      for (const auto curvature : path.curvatures) {
+        curvature_sum += std::abs(curvature);
+      }
+      const auto curvature_average = curvature_sum / static_cast<double>(path.curvatures.size());
+      const auto max_curvature =
+        (curvature_average > 0.0) ? constraints.hard.max_curvature : constraints.hard.min_curvature;
+      return curvature_average / max_curvature;
+      // return constraints.soft.curvature_weight * curvature_sum /
+      //        static_cast<double>(path.curvatures.size());
+    });
 }
 
 bool SamplingPlannerModule::isExecutionRequested() const
@@ -48,6 +138,13 @@ bool SamplingPlannerModule::isExecutionRequested() const
     RCLCPP_WARN(getLogger(), "Backward path is NOT supported. Just converting path to trajectory");
     return false;
   }
+
+  const auto & goal_pose = planner_data_->route_handler->getGoalPose();
+  const auto & ego_pose = planner_data_->self_odometry->pose.pose;
+  const double distance_to_goal = std::hypot(
+    ego_pose.position.x - goal_pose.position.x, ego_pose.position.y - goal_pose.position.y);
+  if (distance_to_goal < 8.0) return false;
+
   return true;
 }
 
@@ -74,7 +171,7 @@ SamplingPlannerData SamplingPlannerModule::createPlannerData(
 
 PathWithLaneId SamplingPlannerModule::convertFrenetPathToPathWithLaneID(
   const frenet_planner::Path frenet_path, const lanelet::ConstLanelets & lanelets,
-  const double velocity)
+  const double path_z)
 {
   auto quaternion_from_rpy = [](double roll, double pitch, double yaw) -> tf2::Quaternion {
     tf2::Quaternion quaternion_tf2;
@@ -86,6 +183,7 @@ PathWithLaneId SamplingPlannerModule::convertFrenetPathToPathWithLaneID(
 
   PathWithLaneId path;
   const auto header = planner_data_->route_handler->getRouteHeader();
+  const auto reference_path_ptr = getPreviousModuleOutput().reference_path;
 
   for (size_t i = 0; i < frenet_path.points.size(); ++i) {
     const auto & frenet_path_point_position = frenet_path.points.at(i);
@@ -94,7 +192,7 @@ PathWithLaneId SamplingPlannerModule::convertFrenetPathToPathWithLaneID(
     PathPointWithLaneId point{};
     point.point.pose.position.x = frenet_path_point_position.x();
     point.point.pose.position.y = frenet_path_point_position.y();
-    point.point.pose.position.z = 0.0;
+    point.point.pose.position.z = path_z;
 
     auto yaw_as_quaternion = quaternion_from_rpy(0.0, 0.0, frenet_path_point_yaw);
     point.point.pose.orientation.w = yaw_as_quaternion.getW();
@@ -114,8 +212,13 @@ PathWithLaneId SamplingPlannerModule::convertFrenetPathToPathWithLaneID(
     if (!is_in_lanes && i > 0) {
       point.lane_ids = path.points.at(i - 1).lane_ids;
     }
-
-    point.point.longitudinal_velocity_mps = velocity;
+    if (reference_path_ptr) {
+      const auto idx = motion_utils::findFirstNearestIndexWithSoftConstraints(
+        reference_path_ptr->points, point.point.pose);
+      const auto & closest_point = reference_path_ptr->points[idx];
+      point.point.longitudinal_velocity_mps = closest_point.point.longitudinal_velocity_mps;
+      point.point.lateral_velocity_mps = closest_point.point.lateral_velocity_mps;
+    }
     path.points.push_back(point);
   }
   return path;
@@ -153,67 +256,158 @@ void SamplingPlannerModule::prepareConstraints(
 
 BehaviorModuleOutput SamplingPlannerModule::plan()
 {
-  // const auto refPath = getPreviousModuleOutput().reference_path;
-  const auto path_ptr = getPreviousModuleOutput().reference_path;
-  if (path_ptr->points.empty()) {
+  const auto reference_path_ptr = getPreviousModuleOutput().reference_path;
+  if (reference_path_ptr->points.empty()) {
     return {};
   }
-  // const auto ego_closest_path_index = planner_data_->findEgoIndex(path_ptr->points);
-  // RCLCPP_INFO(getLogger(), "ego_closest_path_index %ld", ego_closest_path_index);
-  // resetPathCandidate();
-  // resetPathReference();
-  // [[maybe_unused]] const auto path = toPath(*path_ptr);
   auto reference_spline = [&]() -> sampler_common::transform::Spline2D {
     std::vector<double> x;
     std::vector<double> y;
-    x.reserve(path_ptr->points.size());
-    y.reserve(path_ptr->points.size());
-    for (const auto & point : path_ptr->points) {
+    x.reserve(reference_path_ptr->points.size());
+    y.reserve(reference_path_ptr->points.size());
+    for (const auto & point : reference_path_ptr->points) {
       x.push_back(point.point.pose.position.x);
       y.push_back(point.point.pose.position.y);
     }
     return {x, y};
   }();
 
-  const auto pose = planner_data_->self_odometry->pose.pose;
-  sampler_common::State initial_state;
-  Point2d initial_state_pose{pose.position.x, pose.position.y};
-  const auto rpy =
-    tier4_autoware_utils::getRPY(planner_data_->self_odometry->pose.pose.orientation);
-  initial_state.pose = initial_state_pose;
-  initial_state.frenet = reference_spline.frenet({pose.position.x, pose.position.y});
-  initial_state.heading = rpy.z;
+  frenet_planner::FrenetState frenet_initial_state;
+  frenet_planner::SamplingParameters sampling_parameters;
 
-  frenet_planner::SamplingParameters sampling_parameters =
+  const auto & pose = planner_data_->self_odometry->pose.pose;
+  sampler_common::State initial_state =
+    behavior_path_planner::getInitialState(pose, reference_spline);
+  sampling_parameters =
     prepareSamplingParameters(initial_state, reference_spline, *internal_params_);
 
-  const auto drivable_lanes = getPreviousModuleOutput().drivable_area_info.drivable_lanes;
-  const auto left_bound =
-    (utils::calcBound(planner_data_->route_handler, drivable_lanes, false, false, true));
-  const auto right_bound =
-    (utils::calcBound(planner_data_->route_handler, drivable_lanes, false, false, false));
+  auto set_frenet_state = [](
+                            const sampler_common::State & initial_state,
+                            const sampler_common::transform::Spline2D & reference_spline,
+                            frenet_planner::FrenetState & frenet_initial_state)
 
-  const auto sampling_planner_data =
-    createPlannerData(planner_data_->prev_output_path, left_bound, right_bound);
+  {
+    frenet_initial_state.position = initial_state.frenet;
+    const auto frenet_yaw = initial_state.heading - reference_spline.yaw(initial_state.frenet.s);
+    const auto path_curvature = reference_spline.curvature(initial_state.frenet.s);
+    constexpr auto delta_s = 0.001;
+    frenet_initial_state.lateral_velocity =
+      (1 - path_curvature * initial_state.frenet.d) * std::tan(frenet_yaw);
+    const auto path_curvature_deriv =
+      (reference_spline.curvature(initial_state.frenet.s + delta_s) - path_curvature) / delta_s;
+    const auto cos_yaw = std::cos(frenet_yaw);
+    if (cos_yaw == 0.0) {
+      frenet_initial_state.lateral_acceleration = 0.0;
+    } else {
+      frenet_initial_state.lateral_acceleration =
+        -(path_curvature_deriv * initial_state.frenet.d +
+          path_curvature * frenet_initial_state.lateral_velocity) *
+          std::tan(frenet_yaw) +
+        ((1 - path_curvature * initial_state.frenet.d) / (cos_yaw * cos_yaw)) *
+          (initial_state.curvature * ((1 - path_curvature * initial_state.frenet.d) / cos_yaw) -
+           path_curvature);
+    }
+  };
+  set_frenet_state(initial_state, reference_spline, frenet_initial_state);
 
-  prepareConstraints(
-    internal_params_->constraints, planner_data_->dynamic_object, sampling_planner_data.left_bound,
-    sampling_planner_data.right_bound);
+  std::vector<DrivableLanes> drivable_lanes{};
+  {
+    const auto & prev_module_path = getPreviousModuleOutput().path;
+    const auto & current_lanes = utils::getCurrentLanesFromPath(*prev_module_path, planner_data_);
+    // expand drivable lanes
+    std::for_each(current_lanes.begin(), current_lanes.end(), [&](const auto & lanelet) {
+      drivable_lanes.push_back(generateExpandDrivableLanes(lanelet, planner_data_));
+    });
+  }
 
-  frenet_planner::FrenetState frenet_initial_state;
-  frenet_initial_state.position = initial_state.frenet;
+  {
+    const auto left_bound =
+      (utils::calcBound(planner_data_->route_handler, drivable_lanes, false, false, true));
+    const auto right_bound =
+      (utils::calcBound(planner_data_->route_handler, drivable_lanes, false, false, false));
+
+    const auto sampling_planner_data =
+      createPlannerData(planner_data_->prev_output_path, left_bound, right_bound);
+
+    prepareConstraints(
+      internal_params_->constraints, planner_data_->dynamic_object,
+      sampling_planner_data.left_bound, sampling_planner_data.right_bound);
+  }
 
   auto frenet_paths =
     frenet_planner::generatePaths(reference_spline, frenet_initial_state, sampling_parameters);
+  // if (prev_sampling_path_) {
+  //   const auto prev_path = prev_sampling_path_.value();
+  //   frenet_paths.push_back(prev_path);
+  // }
+
+  // EXTEND prev path
+  if (prev_sampling_path_ && prev_sampling_path_->lengths.size() > 1) {
+    // Update previous path
+    frenet_planner::Path prev_path_frenet = prev_sampling_path_.value();
+    frenet_paths.push_back(prev_path_frenet);
+
+    double x = prev_path_frenet.points.back().x();
+    double x_pose = pose.position.x;
+    if (std::abs(x - x_pose) < 90.0) {
+      // sampler_common::State reuse_state;
+      // reuse_state.curvature = reused_path->curvatures.back();
+      // reuse_state.pose = reused_path->points.back();
+      // reuse_state.heading = reused_path->yaws.back();
+      // reuse_state.frenet = reference_spline.frenet(reuse_state.pose);
+      auto quaternion_from_rpy = [](double roll, double pitch, double yaw) -> tf2::Quaternion {
+        tf2::Quaternion quaternion_tf2;
+        quaternion_tf2.setRPY(roll, pitch, yaw);
+        return quaternion_tf2;
+      };
+
+      geometry_msgs::msg::Pose future_pose;
+      future_pose.position.x = prev_path_frenet.points.back().x();
+      future_pose.position.y = prev_path_frenet.points.back().y();
+      future_pose.position.z = pose.position.z;
+
+      const auto future_pose_quaternion =
+        quaternion_from_rpy(0.0, 0.0, prev_path_frenet.yaws.back());
+      future_pose.orientation.w = future_pose_quaternion.w();
+      future_pose.orientation.x = future_pose_quaternion.x();
+      future_pose.orientation.y = future_pose_quaternion.y();
+      future_pose.orientation.z = future_pose_quaternion.z();
+
+      sampler_common::State future_state =
+        behavior_path_planner::getInitialState(future_pose, reference_spline);
+      frenet_planner::FrenetState frenet_reuse_state;
+
+      set_frenet_state(future_state, reference_spline, frenet_reuse_state);
+
+      // frenet_reuse_state.position = prev_path_frenet.frenet_points.back();
+
+      frenet_planner::SamplingParameters extension_sampling_parameters =
+        prepareSamplingParameters(future_state, reference_spline, *internal_params_);
+      auto extension_frenet_paths = frenet_planner::generatePaths(
+        reference_spline, frenet_reuse_state, extension_sampling_parameters);
+      for (auto & p : extension_frenet_paths) frenet_paths.push_back(prev_path_frenet.extend(p));
+    }
+  }
+
+  SoftConstraintsInputs soft_constraints_input;
+  soft_constraints_input.goal_pose = planner_data_->route_handler->getGoalPose();
+  soft_constraints_input.ego_pose = planner_data_->self_odometry->pose.pose;
 
   debug_data_.footprints.clear();
   for (auto & path : frenet_paths) {
+    std::vector<bool> hard_constraints_results;
+    std::vector<double> soft_constraints_results;
     const auto footprint =
-      sampler_common::constraints::checkHardConstraints(path, internal_params_->constraints);
+      sampler_common::constraints::buildFootprintPoints(path, internal_params_->constraints);
+    behavior_path_planner::evaluateHardConstraints(
+      path, internal_params_->constraints, footprint, hard_constraints_, hard_constraints_results);
+    path.constraint_results.curvature = true;
     debug_data_.footprints.push_back(footprint);
-    sampler_common::constraints::calculateCost(
-      path, internal_params_->constraints, reference_spline);
+    evaluateSoftConstraints(
+      path, internal_params_->constraints, soft_constraints_, soft_constraints_input,
+      soft_constraints_results);
   }
+
   std::vector<sampler_common::Path> candidate_paths;
   const auto move_to_paths = [&candidate_paths](auto & paths_to_move) {
     candidate_paths.insert(
@@ -231,7 +425,7 @@ BehaviorModuleOutput SamplingPlannerModule::plan()
     auto min_cost = std::numeric_limits<double>::max();
     size_t best_path_idx = 0;
     for (auto i = 0LU; i < paths.size(); ++i) {
-      if (paths[i].constraint_results.isValid() && paths[i].cost < min_cost) {
+      if (paths[i].constraints_satisfied && paths[i].cost < min_cost) {
         best_path_idx = i;
         min_cost = paths[i].cost;
       }
@@ -243,26 +437,29 @@ BehaviorModuleOutput SamplingPlannerModule::plan()
 
   if (!selected_path_idx) {
     BehaviorModuleOutput out;
-    const auto p = getPreviousModuleOutput().reference_path;
+    const auto p = getPreviousModuleOutput().path;
     out.path = p;
     out.reference_path = p;
     out.drivable_area_info = getPreviousModuleOutput().drivable_area_info;
     return out;
   }
 
-  BehaviorModuleOutput out;
-  const double velocity = 0.5;
+  const auto best_path = frenet_paths[*selected_path_idx];
+  prev_sampling_path_ = best_path;
+
   const double max_length = *std::max_element(
     internal_params_->sampling.target_lengths.begin(),
     internal_params_->sampling.target_lengths.end());
-  const auto road_lanes = utils::getExtendedCurrentLanes(planner_data_, 0, max_length, false);
+  const auto road_lanes =
+    utils::getExtendedCurrentLanes(planner_data_, max_length, max_length, false);
+  auto out_path = convertFrenetPathToPathWithLaneID(
+    best_path, road_lanes, soft_constraints_input.goal_pose.position.z);
 
-  const auto best_path = frenet_paths[*selected_path_idx];
-  const auto out_path = convertFrenetPathToPathWithLaneID(best_path, road_lanes, velocity);
+  BehaviorModuleOutput out;
   out.path = std::make_shared<PathWithLaneId>(out_path);
-  const auto p = getPreviousModuleOutput().reference_path;
-  out.reference_path = p;
+  out.reference_path = reference_path_ptr;
   out.drivable_area_info = getPreviousModuleOutput().drivable_area_info;
+  extendOutputDrivableArea(out);
   return out;
 }
 
@@ -333,27 +530,53 @@ void SamplingPlannerModule::updateDebugMarkers()
   // }
   // debug_marker_.markers.push_back(m);
   // info_marker_.markers.push_back(m);
-  // m.type = m.LINE_STRIP;
-  // m.ns = "obstacles";
-  // m.id = 0UL;
-  // m.color.r = 1.0;
-  // m.color.g = 0.0;
-  // m.color.b = 0.0;
-  // for (const auto & obs : debug_data_.obstacles) {
-  //   m.points.clear();
-  //   for (const auto & p : obs.outer())
-  //     m.points.push_back(geometry_msgs::msg::Point().set__x(p.x()).set__y(p.y()));
-  //   debug_marker_.markers.push_back(m);
-  //   info_marker_.markers.push_back(m);
-  //   ++m.id;
-  // }
-  // m.action = m.DELETE;
-  // m.ns = "candidates";
-  // for (m.id = debug_data_.sampled_candidates.size();
-  //      static_cast<size_t>(m.id) < debug_data_.previous_sampled_candidates_nb; ++m.id) {
-  //   debug_marker_.markers.push_back(m);
-  //   info_marker_.markers.push_back(m);
-  // }
+  m.type = m.LINE_STRIP;
+  m.ns = "obstacles";
+  m.id = 0UL;
+  m.color.r = 1.0;
+  m.color.g = 0.0;
+  m.color.b = 0.0;
+  for (const auto & obs : debug_data_.obstacles) {
+    m.points.clear();
+    for (const auto & p : obs.outer())
+      m.points.push_back(geometry_msgs::msg::Point().set__x(p.x()).set__y(p.y()));
+    debug_marker_.markers.push_back(m);
+    info_marker_.markers.push_back(m);
+    ++m.id;
+  }
+  m.action = m.DELETE;
+  m.ns = "candidates";
+  for (m.id = debug_data_.sampled_candidates.size();
+       static_cast<size_t>(m.id) < debug_data_.previous_sampled_candidates_nb; ++m.id) {
+    debug_marker_.markers.push_back(m);
+    info_marker_.markers.push_back(m);
+  }
+}
+
+void SamplingPlannerModule::extendOutputDrivableArea(BehaviorModuleOutput & output)
+{
+  const auto prev_module_path = getPreviousModuleOutput().path;
+  const auto current_lanes = utils::getCurrentLanesFromPath(*prev_module_path, planner_data_);
+
+  std::vector<DrivableLanes> drivable_lanes{};
+  // expand drivable lanes
+  std::for_each(current_lanes.begin(), current_lanes.end(), [&](const auto & lanelet) {
+    drivable_lanes.push_back(generateExpandDrivableLanes(lanelet, planner_data_));
+  });
+
+  // // const auto drivable_lanes = utils::lane_change::generateDrivableLanes(
+  // //   *planner_data_->route_handler, current_lanes, status_.target_lanes);
+  // const auto drivable_lanes = behavior_path_planner::utils::generateDrivableLanes(current_lanes);
+  // const auto shorten_lanes = utils::cutOverlappedLanes(*output.path, drivable_lanes);
+  // const auto expanded_lanes = utils::expandLanelets(
+  //   shorten_lanes, dp.drivable_area_left_bound_offset, dp.drivable_area_right_bound_offset,
+  //   dp.drivable_area_types_to_skip);
+
+  // // for new architecture
+  DrivableAreaInfo current_drivable_area_info;
+  current_drivable_area_info.drivable_lanes = drivable_lanes;
+  output.drivable_area_info = utils::combineDrivableAreaInfo(
+    current_drivable_area_info, getPreviousModuleOutput().drivable_area_info);
 }
 
 CandidateOutput SamplingPlannerModule::planCandidate() const
@@ -363,6 +586,158 @@ CandidateOutput SamplingPlannerModule::planCandidate() const
 
 void SamplingPlannerModule::updateData()
 {
+}
+
+// utils
+
+template <typename T>
+void pushUniqueVector(T & base_vector, const T & additional_vector)
+{
+  base_vector.insert(base_vector.end(), additional_vector.begin(), additional_vector.end());
+}
+
+bool SamplingPlannerModule::isEndPointsConnected(
+  const lanelet::ConstLanelet & left_lane, const lanelet::ConstLanelet & right_lane)
+{
+  const auto & left_back_point_2d = right_lane.leftBound2d().back().basicPoint();
+  const auto & right_back_point_2d = left_lane.rightBound2d().back().basicPoint();
+
+  constexpr double epsilon = 1e-5;
+  return (right_back_point_2d - left_back_point_2d).norm() < epsilon;
+}
+
+DrivableLanes SamplingPlannerModule::generateExpandDrivableLanes(
+  const lanelet::ConstLanelet & lanelet, const std::shared_ptr<const PlannerData> & planner_data)
+{
+  const auto & route_handler = planner_data->route_handler;
+
+  DrivableLanes current_drivable_lanes;
+  current_drivable_lanes.left_lane = lanelet;
+  current_drivable_lanes.right_lane = lanelet;
+
+  // 1. get left/right side lanes
+  const auto update_left_lanelets = [&](const lanelet::ConstLanelet & target_lane) {
+    const auto all_left_lanelets =
+      route_handler->getAllLeftSharedLinestringLanelets(target_lane, true, true);
+    if (!all_left_lanelets.empty()) {
+      current_drivable_lanes.left_lane = all_left_lanelets.back();  // leftmost lanelet
+      pushUniqueVector(
+        current_drivable_lanes.middle_lanes,
+        lanelet::ConstLanelets(all_left_lanelets.begin(), all_left_lanelets.end() - 1));
+    }
+  };
+  const auto update_right_lanelets = [&](const lanelet::ConstLanelet & target_lane) {
+    const auto all_right_lanelets =
+      route_handler->getAllRightSharedLinestringLanelets(target_lane, true, true);
+    if (!all_right_lanelets.empty()) {
+      current_drivable_lanes.right_lane = all_right_lanelets.back();  // rightmost lanelet
+      pushUniqueVector(
+        current_drivable_lanes.middle_lanes,
+        lanelet::ConstLanelets(all_right_lanelets.begin(), all_right_lanelets.end() - 1));
+    }
+  };
+
+  update_left_lanelets(lanelet);
+  update_right_lanelets(lanelet);
+
+  // 2.1 when there are multiple lanes whose previous lanelet is the same
+  const auto get_next_lanes_from_same_previous_lane =
+    [&route_handler](const lanelet::ConstLanelet & lane) {
+      // get previous lane, and return false if previous lane does not exist
+      lanelet::ConstLanelets prev_lanes;
+      if (!route_handler->getPreviousLaneletsWithinRoute(lane, &prev_lanes)) {
+        return lanelet::ConstLanelets{};
+      }
+
+      lanelet::ConstLanelets next_lanes;
+      for (const auto & prev_lane : prev_lanes) {
+        const auto next_lanes_from_prev = route_handler->getNextLanelets(prev_lane);
+        pushUniqueVector(next_lanes, next_lanes_from_prev);
+      }
+      return next_lanes;
+    };
+
+  const auto next_lanes_for_right =
+    get_next_lanes_from_same_previous_lane(current_drivable_lanes.right_lane);
+  const auto next_lanes_for_left =
+    get_next_lanes_from_same_previous_lane(current_drivable_lanes.left_lane);
+
+  // 2.2 look for neighbor lane recursively, where end line of the lane is connected to end line
+  // of the original lane
+  const auto update_drivable_lanes =
+    [&](const lanelet::ConstLanelets & next_lanes, const bool is_left) {
+      for (const auto & next_lane : next_lanes) {
+        const auto & edge_lane =
+          is_left ? current_drivable_lanes.left_lane : current_drivable_lanes.right_lane;
+        if (next_lane.id() == edge_lane.id()) {
+          continue;
+        }
+
+        const auto & left_lane = is_left ? next_lane : edge_lane;
+        const auto & right_lane = is_left ? edge_lane : next_lane;
+        if (!isEndPointsConnected(left_lane, right_lane)) {
+          continue;
+        }
+
+        if (is_left) {
+          current_drivable_lanes.left_lane = next_lane;
+        } else {
+          current_drivable_lanes.right_lane = next_lane;
+        }
+
+        const auto & middle_lanes = current_drivable_lanes.middle_lanes;
+        const auto has_same_lane = std::any_of(
+          middle_lanes.begin(), middle_lanes.end(),
+          [&edge_lane](const auto & lane) { return lane.id() == edge_lane.id(); });
+
+        if (!has_same_lane) {
+          if (is_left) {
+            if (current_drivable_lanes.right_lane.id() != edge_lane.id()) {
+              current_drivable_lanes.middle_lanes.push_back(edge_lane);
+            }
+          } else {
+            if (current_drivable_lanes.left_lane.id() != edge_lane.id()) {
+              current_drivable_lanes.middle_lanes.push_back(edge_lane);
+            }
+          }
+        }
+
+        return true;
+      }
+      return false;
+    };
+
+  const auto expand_drivable_area_recursively =
+    [&](const lanelet::ConstLanelets & next_lanes, const bool is_left) {
+      // NOTE: set max search num to avoid infinity loop for drivable area expansion
+      constexpr size_t max_recursive_search_num = 3;
+      for (size_t i = 0; i < max_recursive_search_num; ++i) {
+        const bool is_update_kept = update_drivable_lanes(next_lanes, is_left);
+        if (!is_update_kept) {
+          break;
+        }
+        if (i == max_recursive_search_num - 1) {
+          RCLCPP_ERROR(
+            rclcpp::get_logger("behavior_path_planner").get_child("avoidance"),
+            "Drivable area expansion reaches max iteration.");
+        }
+      }
+    };
+  expand_drivable_area_recursively(next_lanes_for_right, false);
+  expand_drivable_area_recursively(next_lanes_for_left, true);
+
+  // 3. update again for new left/right lanes
+  update_left_lanelets(current_drivable_lanes.left_lane);
+  update_right_lanelets(current_drivable_lanes.right_lane);
+
+  // 4. compensate that current_lane is in either of left_lane, right_lane or middle_lanes.
+  if (
+    current_drivable_lanes.left_lane.id() != lanelet.id() &&
+    current_drivable_lanes.right_lane.id() != lanelet.id()) {
+    current_drivable_lanes.middle_lanes.push_back(lanelet);
+  }
+
+  return current_drivable_lanes;
 }
 
 frenet_planner::SamplingParameters SamplingPlannerModule::prepareSamplingParameters(

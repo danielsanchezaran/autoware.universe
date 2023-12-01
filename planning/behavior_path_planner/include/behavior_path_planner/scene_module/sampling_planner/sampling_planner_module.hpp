@@ -24,22 +24,22 @@
 #include "bezier_sampler/bezier_sampling.hpp"
 #include "frenet_planner/frenet_planner.hpp"
 #include "lanelet2_extension/utility/utilities.hpp"
+#include "motion_utils/trajectory/path_with_lane_id.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "sampler_common/constraints/footprint.hpp"
 #include "sampler_common/constraints/hard_constraint.hpp"
 #include "sampler_common/constraints/soft_constraint.hpp"
 #include "sampler_common/structures.hpp"
 #include "sampler_common/transform/spline_transform.hpp"
 #include "tier4_autoware_utils/geometry/boost_geometry.hpp"
 #include "tier4_autoware_utils/geometry/boost_polygon_utils.hpp"
+#include "tier4_autoware_utils/math/constants.hpp"
 #include "tier4_autoware_utils/ros/update_param.hpp"
 #include "tier4_autoware_utils/system/stop_watch.hpp"
 #include "vehicle_info_util/vehicle_info_util.hpp"
 
-#include <rclcpp/rclcpp.hpp>
-#include <tier4_autoware_utils/geometry/boost_geometry.hpp>
-
-#include <autoware_auto_planning_msgs/msg/path_with_lane_id.hpp>
-#include <tier4_planning_msgs/msg/lateral_offset.hpp>
+#include "autoware_auto_planning_msgs/msg/path_with_lane_id.hpp"
+#include "tier4_planning_msgs/msg/lateral_offset.hpp"
 
 #include <algorithm>
 #include <any>
@@ -97,7 +97,7 @@ public:
       user_params_->lateral_deviation_weight;
     internal_params_->constraints.soft.length_weight = user_params_->length_weight;
     internal_params_->constraints.soft.curvature_weight = user_params_->curvature_weight;
-    internal_params_->constraints.ego_footprint = vehicle_info_.createFootprint(0.35);
+    internal_params_->constraints.ego_footprint = vehicle_info_.createFootprint(0.75);
     internal_params_->constraints.ego_width = vehicle_info_.vehicle_width_m;
     internal_params_->constraints.ego_length = vehicle_info_.vehicle_length_m;
     // Sampling
@@ -134,6 +134,8 @@ public:
   }
 
   SamplingPlannerDebugData debug_data_;
+  behavior_path_planner::HardConstraintsFunctionVector hard_constraints_;
+  behavior_path_planner::SoftConstraintsFunctionVector soft_constraints_;
 
 private:
   SamplingPlannerData createPlannerData(
@@ -163,11 +165,20 @@ private:
 
   PathWithLaneId convertFrenetPathToPathWithLaneID(
     const frenet_planner::Path frenet_path, const lanelet::ConstLanelets & lanelets,
-    const double velocity);
+    const double path_z);
+
   // member
   // std::shared_ptr<SamplingPlannerParameters> params_;
   std::shared_ptr<SamplingPlannerInternalParameters> internal_params_;
   vehicle_info_util::VehicleInfo vehicle_info_{};
+  std::optional<frenet_planner::Path> prev_sampling_path_ = std::nullopt;
+  // move to utils
+
+  void extendOutputDrivableArea(BehaviorModuleOutput & output);
+  bool isEndPointsConnected(
+    const lanelet::ConstLanelet & left_lane, const lanelet::ConstLanelet & right_lane);
+  DrivableLanes generateExpandDrivableLanes(
+    const lanelet::ConstLanelet & lanelet, const std::shared_ptr<const PlannerData> & planner_data);
 };
 
 }  // namespace behavior_path_planner

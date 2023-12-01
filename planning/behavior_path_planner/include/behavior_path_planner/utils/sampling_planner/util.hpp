@@ -14,9 +14,80 @@
 
 #ifndef BEHAVIOR_PATH_PLANNER__UTILS__SAMPLING_PLANNER__UTIL_HPP_
 #define BEHAVIOR_PATH_PLANNER__UTILS__SAMPLING_PLANNER__UTIL_HPP_
+#include "sampler_common/structures.hpp"
+#include "sampler_common/transform/spline_transform.hpp"
+
+#include <any>
+#include <functional>
+#include <optional>
+#include <vector>
 
 namespace behavior_path_planner
 {
+using geometry_msgs::msg::Pose;
+
+struct SoftConstraintsInputs
+{
+  Pose goal_pose;
+  Pose ego_pose;
+  std::optional<sampler_common::Path> prev_path;
+};
+
+using SoftConstraintsFunctionVector = std::vector<std::function<double(
+  sampler_common::Path &, const sampler_common::Constraints &, const SoftConstraintsInputs &)>>;
+
+using HardConstraintsFunctionVector = std::vector<std::function<bool(
+  sampler_common::Path &, const sampler_common::Constraints &, const MultiPoint2d &)>>;
+
+inline void evaluateSoftConstraints(
+  sampler_common::Path & path, const sampler_common::Constraints & constraints,
+  const SoftConstraintsFunctionVector & soft_constraints, const SoftConstraintsInputs & input_data,
+  std::vector<double> & constraints_results)
+{
+  constraints_results.clear();
+  constraints_results.resize(soft_constraints.size());
+  double constraints_evaluation = 0.0;
+  for (const auto & f : soft_constraints) {
+    const auto value = f(path, constraints, input_data);
+    constraints_results.push_back(value);
+    constraints_evaluation += value;
+  }
+  path.cost = constraints_evaluation;
+  return;
+}
+
+inline void evaluateHardConstraints(
+  sampler_common::Path & path, const sampler_common::Constraints & constraints,
+  const MultiPoint2d & footprint, const HardConstraintsFunctionVector & hard_constraints,
+  std::vector<bool> & constraints_results)
+{
+  constraints_results.clear();
+  constraints_results.resize(hard_constraints.size());
+  bool constraints_passed = true;
+  int idx = 0;
+  for (const auto & f : hard_constraints) {
+    const bool constraint_check = f(path, constraints, footprint);
+    constraints_passed &= constraint_check;
+    constraints_results[idx] = constraint_check;
+    ++idx;
+  }
+
+  path.constraints_satisfied = constraints_passed;
+  return;
+}
+
+inline sampler_common::State getInitialState(
+  const geometry_msgs::msg::Pose & pose,
+  const sampler_common::transform::Spline2D & reference_spline)
+{
+  sampler_common::State initial_state;
+  Point2d initial_state_pose{pose.position.x, pose.position.y};
+  const auto rpy = tier4_autoware_utils::getRPY(pose.orientation);
+  initial_state.pose = initial_state_pose;
+  initial_state.frenet = reference_spline.frenet({pose.position.x, pose.position.y});
+  initial_state.heading = rpy.z;
+  return initial_state;
+}
 
 }  // namespace behavior_path_planner
 
