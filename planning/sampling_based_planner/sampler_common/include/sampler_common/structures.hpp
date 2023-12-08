@@ -20,6 +20,8 @@
 #include <eigen3/Eigen/Core>
 #include <interpolation/linear_interpolation.hpp>
 
+#include <geometry_msgs/msg/pose.hpp>
+
 #include <boost/geometry/core/cs.hpp>
 #include <boost/geometry/geometries/multi_polygon.hpp>
 #include <boost/geometry/geometries/point_xy.hpp>
@@ -79,6 +81,8 @@ struct Path
   std::vector<double> curvatures{};
   std::vector<double> yaws{};
   std::vector<double> lengths{};
+  std::vector<geometry_msgs::msg::Pose> poses{};
+
   bool constraints_satisfied;
   ConstraintResults constraint_results{};
   double cost{};
@@ -93,6 +97,7 @@ struct Path
     curvatures.clear();
     yaws.clear();
     lengths.clear();
+    poses.clear();
     constraint_results.clear();
     tag = "";
     cost = 0.0;
@@ -104,6 +109,7 @@ struct Path
     curvatures.reserve(size);
     yaws.reserve(size);
     lengths.reserve(size);
+    poses.reserve(size);
   }
 
   [[nodiscard]] Path extend(const Path & path) const
@@ -127,6 +133,7 @@ struct Path
     ext(extended_path.points, points, path.points);
     ext(extended_path.curvatures, curvatures, path.curvatures);
     ext(extended_path.yaws, yaws, path.yaws);
+    ext(extended_path.poses, poses, path.poses);
     extended_path.lengths.insert(extended_path.lengths.end(), lengths.begin(), lengths.end());
     const auto last_base_length = lengths.empty() ? 0.0 : lengths.back() + length_offset;
     for (size_t i = offset; i < path.lengths.size(); ++i)
@@ -328,6 +335,7 @@ struct Constraints
     double lateral_deviation_weight;
     double length_weight;
     double curvature_weight;
+    std::vector<double> weights;
   } soft{};
   struct
   {

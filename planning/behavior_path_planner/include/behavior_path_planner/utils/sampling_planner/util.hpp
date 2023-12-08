@@ -19,9 +19,9 @@
 
 #include <any>
 #include <functional>
+#include <numeric>
 #include <optional>
 #include <vector>
-
 namespace behavior_path_planner
 {
 using geometry_msgs::msg::Pose;
@@ -30,7 +30,13 @@ struct SoftConstraintsInputs
 {
   Pose goal_pose;
   Pose ego_pose;
+  lanelet::ArcCoordinates ego_arc;
+  lanelet::ArcCoordinates goal_arc;
+  lanelet::ConstLanelets closest_lanelets_to_goal;
+  behavior_path_planner::PlanResult reference_path;
+  behavior_path_planner::PlanResult prev_module_path;
   std::optional<sampler_common::Path> prev_path;
+  lanelet::ConstLanelets current_lanes;
 };
 
 using SoftConstraintsFunctionVector = std::vector<std::function<double(
@@ -41,18 +47,21 @@ using HardConstraintsFunctionVector = std::vector<std::function<bool(
 
 inline void evaluateSoftConstraints(
   sampler_common::Path & path, const sampler_common::Constraints & constraints,
-  const SoftConstraintsFunctionVector & soft_constraints, const SoftConstraintsInputs & input_data,
-  std::vector<double> & constraints_results)
+  const SoftConstraintsFunctionVector & soft_constraints_functions,
+  const SoftConstraintsInputs & input_data, std::vector<double> & constraints_results)
 {
   constraints_results.clear();
-  constraints_results.resize(soft_constraints.size());
-  double constraints_evaluation = 0.0;
-  for (const auto & f : soft_constraints) {
-    const auto value = f(path, constraints, input_data);
-    constraints_results.push_back(value);
-    constraints_evaluation += value;
+  for (const auto & f : soft_constraints_functions) {
+    const auto cost = f(path, constraints, input_data);
+    constraints_results.push_back(cost);
   }
-  path.cost = constraints_evaluation;
+  if (constraints.soft.weights.size() != constraints_results.size()) {
+    path.cost = std::accumulate(constraints_results.begin(), constraints_results.end(), 0.0);
+    return;
+  }
+
+  path.cost = std::inner_product(
+    constraints_results.begin(), constraints_results.end(), constraints.soft.weights.begin(), 0.0);
   return;
 }
 
@@ -62,13 +71,12 @@ inline void evaluateHardConstraints(
   std::vector<bool> & constraints_results)
 {
   constraints_results.clear();
-  constraints_results.resize(hard_constraints.size());
   bool constraints_passed = true;
   int idx = 0;
   for (const auto & f : hard_constraints) {
     const bool constraint_check = f(path, constraints, footprint);
     constraints_passed &= constraint_check;
-    constraints_results[idx] = constraint_check;
+    constraints_results.push_back(constraint_check);
     ++idx;
   }
 
