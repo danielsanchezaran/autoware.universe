@@ -165,7 +165,8 @@ bool SamplingPlannerModule::isExecutionRequested() const
     return false;
   }
 
-  return !isReferencePathSafe();
+  // return !isReferencePathSafe();
+  return true;
 }
 
 bool SamplingPlannerModule::isReferencePathSafe() const
@@ -602,7 +603,10 @@ BehaviorModuleOutput SamplingPlannerModule::plan()
 
   const auto selected_path_idx = best_path_idx(frenet_paths);
 
-  if (!selected_path_idx) {
+  if (
+    !selected_path_idx ||
+    std::abs(soft_constraints_input.ego_arc.length - soft_constraints_input.goal_arc.length) <
+      1.0) {
     BehaviorModuleOutput out;
     PathWithLaneId out_path = (prev_sampling_path_)
                                 ? convertFrenetPathToPathWithLaneID(
