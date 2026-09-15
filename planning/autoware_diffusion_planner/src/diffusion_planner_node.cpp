@@ -30,7 +30,6 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -254,13 +253,16 @@ void DiffusionPlanner::set_up_params()
   }
   // `correction_gain` was this parameter under an inverted meaning: gain 1 was the raw pose and
   // gain 0 the strongest snap, which reads backwards and was misconfigured in practice. Fail
-  // loudly on the old name rather than silently running at a different strength.
-  if (!std::isnan(this->declare_parameter<double>(
-        "ego_snap_to_prev_trajectory.correction_gain", std::numeric_limits<double>::quiet_NaN()))) {
-    throw std::runtime_error(
-      "ego_snap_to_prev_trajectory.correction_gain has been replaced by "
-      "ego_snap_to_prev_trajectory.snap_strength with the opposite sense: set "
-      "snap_strength = 1 - correction_gain (0 disables the snap, 1 stays on the previous plan).");
+  // loudly on the old name rather than silently running at a different strength. Read the node's
+  // overrides instead of declaring the old name: a declared parameter stays on the node for its
+  // lifetime and shows up in introspection tools holding the sentinel value.
+  for (const auto & param_override : this->get_node_options().parameter_overrides()) {
+    if (param_override.get_name() == "ego_snap_to_prev_trajectory.correction_gain") {
+      throw std::runtime_error(
+        "ego_snap_to_prev_trajectory.correction_gain has been replaced by "
+        "ego_snap_to_prev_trajectory.snap_strength with the opposite sense: set "
+        "snap_strength = 1 - correction_gain (0 disables the snap, 1 stays on the previous plan).");
+    }
   }
   params_.ego_snap_to_prev_trajectory.history_prefix_count =
     this->declare_parameter<int64_t>("ego_snap_to_prev_trajectory.history_prefix_count", 10);
@@ -272,9 +274,8 @@ void DiffusionPlanner::set_up_params()
     this->declare_parameter<double>("ego_snap_to_prev_trajectory.yaw_fit_min_length_m", 0.2);
   // The parameter callback is registered after this function returns, so startup values would
   // otherwise bypass the checks it applies to runtime updates.
-  if (
-    const std::string reason = validate_ego_snap_params(params_.ego_snap_to_prev_trajectory);
-    !reason.empty()) {
+  if (const std::string reason = validate_ego_snap_params(params_.ego_snap_to_prev_trajectory);
+      !reason.empty()) {
     throw std::runtime_error(reason);
   }
   params_.start_guidance_reference_distance_m =
@@ -449,9 +450,9 @@ SetParametersResult DiffusionPlanner::on_parameter(
     update_param<double>(
       parameters, "guidance.centerline_guidance.start_time_s",
       temp_params.centerline_guidance_start_time_s);
-    if (
-      const std::string reason = validate_ego_snap_params(temp_params.ego_snap_to_prev_trajectory);
-      !reason.empty()) {
+    if (const std::string reason =
+          validate_ego_snap_params(temp_params.ego_snap_to_prev_trajectory);
+        !reason.empty()) {
       SetParametersResult result;
       result.successful = false;
       result.reason = reason;
